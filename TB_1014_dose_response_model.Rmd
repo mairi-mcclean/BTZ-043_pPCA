@@ -1,0 +1,819 @@
+---
+title: "pPPCA_model_validation_TBPACTS"
+output: html_document
+---
+## Get pkgs
+```{r}
+pkgs<-c("tidyverse","lme4","ggplot2","emmeans","RColorBrewer","patchwork","gt",
+          "grid","broom.mixed","pbkrtest","jtools","car", "Gmisc", "htmlTable",
+        "gtsummary", "lmerTest", "purrr")
+lapply(pkgs, require, character.only=T)
+```
+
+## Read in data
+```{r}
+## write out of dose-response models in R
+df<-read.csv("/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/260526mm_pPCA_TB1014.csv")
+#df<-read.csv("/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/260605mm_pPCA_TB1014_ULQTTP.csv")
+
+#df<-read.csv("/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/260605mm_pPCA_TB1014_ALL_REMOVED.csv")
+
+df<-read.csv("/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/260608mm_pPCA_TB1014_ALL_REMOVED.csv")
+df<-df|>
+  mutate(across(c(USUBJID,ARM,SEX), as.factor))|>
+  rename(PC1 = pc1)|>
+  select(-c(logCFU,logTTP))
+```
+
+```{r}
+df_raw<-read.csv("/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/2600605mm_TB1014_raw.csv")
+df_raw<-df_raw|>
+  select(c("USUBJID","logCFU","logTTP","DAY","ARM"))
+```
+
+##### Drop rows U/BLQ
+```{r}
+df_cfu<-df_raw|>
+  select(c("USUBJID","logCFU","DAY", "ARM"))|>
+  filter(!logCFU <= 0) ## Will not keep NAs here - this is correct; will be less than df used for PCA
+
+df_ttp<-df_raw|>
+  select(c("USUBJID","logTTP","DAY", "ARM"))|>
+  filter(!logTTP >= 2.77)  ## Will not keep NAs here - this is correct; will be less than df used for PCA
+```
+
+
+
+```{r}
+dfs<-list(df,df_cfu,df_ttp)
+df_all<-purrr::reduce(.x=dfs,merge, by=c("USUBJID","DAY"),all=T)
+```
+
+
+### Quick vis
+```{r}
+bm_all<-df_all |>
+  pivot_longer(c(logCFU,logTTP,PC1),
+    names_to="assay",
+    values_to="value"
+  ) |>
+  select(-c(SEX,AGE,pc2))
+```
+
+```{r}
+plt<-ggplot(data = bm_all, aes(x = DAY, y = value, color = USUBJID)) +
+  geom_line() +
+  stat_summary(
+    fun = median,
+    geom = "line", na.rm = TRUE,
+    aes(group = assay, color=assay),
+   size = 1.5
+  ) + 
+#  coord_cartesian()+
+  scale_color_manual(
+    values = c(
+      setNames(rep("grey70", length(unique(bm_all$USUBJID))), unique(bm_all$USUBJID)),
+      setNames(brewer.pal(3, "Set2"), unique(bm_all$assay))
+    )
+  ) +
+  facet_wrap(
+    ~ assay,shrink = FALSE,
+    scales = "free_y",# independent = "y",
+    ncol = 3,
+             labeller = labeller(
+              assay = c("logCFU" = "log10 CFU/ml",
+                        "logTTP" = "log10 MGIT TTP (h)",
+                        "pc1_all"="PC1")
+            )) +
+  ggtitle("Per-patient trajectories by measurement") +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        strip.text=element_text(size=12)) +
+  labs(y = "Assay value", x = "Days on treament")
+
+plt
+```
+> MGIT values reaching log10 == 4? this is plotting artifact, no values like this
+> exist in df
+
+```{r}
+ggsave("260608mm_tb1014_spaghetti_NOULLQ.tiff", plt, device='tiff', dpi=600,
+       bg="white",width = 178,height=100,units='mm')
+```
+
+
+### Get summary tables over time
+```{r}
+### read in the 'raw' data (with the U/LLO values)
+#['logCFU'] <= -3.0
+#['logTTP'] >= 3.014
+
+X<-read.csv('/Users/mairi.mcclean/Desktop/lva_phII/code_output/tb1014/data_man/250710mm_mb_dm.csv')
+X<-X|>
+  select(c('USUBJID', 'DAY','ARM', 'logCFU', 'logTTP','AGE', 'SEX'))
+```
+
+```{r}
+day0<-X|>
+  filter(DAY %in% c(-2.0,-1.0))|>
+  group_by(USUBJID)|>
+  summarise(logCFU=mean(logCFU,na.rm=T),
+            logTTP=mean(logTTP,na.rm=T),
+            across(c(ARM,SEX,AGE), \(.x) first(.x)))|>
+  mutate(DAY = 0)
+
+rest<-X|>
+  filter(!DAY %in% c(-2.0,-1.0))
+
+X_<-rbind(day0,rest)
+
+treatment_window<-c(0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0)
+X_<-X_|>
+  filter(DAY %in% treatment_window)
+```
+
+```{r}
+### get count of values U/LLQ
+length(which(X_$logCFU <= log(1))) # 1 CFU/ml <- BURGER
+length(which(X_$logTTP >= log(25))) # 25days <- DUFAULT
+```
+
+
+```{r}
+X_%>% Gmisc::getDescriptionStatsBy("logCFU", "logTTP", 
+                               by = DAY, 
+                               add_total_col = F, 
+                               hrzl_prop = T, total_col_show_perc = T,
+                               show_all_values = T,
+                               continuous_fn = describeMedian,
+                               header_count = T) %>%
+  htmlTable::htmlTable(caption = "Stage 2: Summary statistics by assay over time",
+                       align = "center", width = "100%"
+                       )%>%
+  htmlTable::addHtmlTableStyle(css.cell = "padding-left: .15em; padding-right: .15em;",
+                    css.header = "font-weight: normal")
+
+```
+
+```{r}
+X_ |>
+  tbl_summary(
+    by = DAY,
+    include = c(logCFU, logTTP),
+    digits = all_continuous() ~ 2,
+    missing_text = "Missing, n"
+  )|>
+  modify_header(label="**Assay**")|>
+  modify_caption("**Stage 2: Summary statistics by assay over time, per arm**")
+```
+
+
+
+
+## Models
+### Linear mixed models
+#### TTP
+```{r}
+### Random slope + INTERCEPT
+LinearMixed_TTP <- lmer(logTTP ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df_ttp) 
+coef_model_TTP <- coef(LinearMixed_TTP)$USUBJID
+
+# Now tidy using broom
+stage2_slope_ttp <- tidy(LinearMixed_TTP) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_ttp$se_fixed_effects <- summary(LinearMixed_TTP)$coefficients[, "Std. Error"]
+confint(LinearMixed_TTP, method = "Wald")
+# For comparison 
+comp_ttp_coefs<- stage2_slope_ttp
+```
+
+```{r}
+summary(LinearMixed_TTP)
+```
+
+```{r}
+gr_ttp <- ref_grid(LinearMixed_TTP, cov.keep= c('ARM', 'DAY'))
+emm_ttp <- emmeans(gr_ttp, spec= c('ARM', 'DAY'), level= 0.95)
+emm_ttp_df <- as.data.frame(emm_ttp)
+```
+
+```{r}
+ggplot(df, aes(x=DAY, y=logTTP))+
+        geom_line(data= data.frame(emm_ttp), aes(y= emmean), color ='blue', size = 1.5) +
+        scale_x_continuous(limits = c(0, 15), breaks = c(0,2,4,6,8,10,12,14))+
+        facet_wrap(~ARM,nrow=2)+
+        labs(y = "log10(TTP) (hrs)",
+             x = "Day(s) of treatment")+
+        theme(axis.title = element_text(size = 16))
+
+```
+
+#### CFU
+```{r}
+LinearMixed_CFU <- lmer(logCFU ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df_cfu) 
+coef_model_CFU <- coef(LinearMixed_CFU)$USUBJID
+
+# Now tidy using broom
+stage2_slope_cfu <- tidy(LinearMixed_CFU) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_cfu$se_fixed_effects <- summary(LinearMixed_CFU)$coefficients[, "Std. Error"]
+confint(LinearMixed_CFU, method = "Wald")
+# For comparison 
+comp_cfu_coefs<- stage2_slope_cfu
+```
+
+```{r}
+summary(LinearMixed_CFU)
+```
+
+```{r}
+gr_cfu <- ref_grid(LinearMixed_CFU, cov.keep= c('ARM', 'DAY'))
+emm_cfu <- emmeans(gr_cfu, spec= c('ARM', 'DAY'), level= 0.95)
+emm_cfu_df <- as.data.frame(emm_cfu)
+```
+
+```{r}
+ggplot(df, aes(x=DAY, y=logCFU))+
+        geom_line(data= data.frame(emm_cfu), aes(y= emmean), color ='blue', size = 1.5) +
+        scale_x_continuous(limits = c(0, 15), breaks = c(0,2,4,6,8,10,12,14))+
+        facet_wrap(~ARM,nrow=2)+
+        labs(y = "log10(CFU)",
+             x = "Day(s) of treatment")+
+        theme(axis.title = element_text(size = 16))
+
+```
+
+#### PC1
+```{r}
+LinearMixed_PC1 <- lmer(PC1 ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df) 
+coef_model_pc1 <- coef(LinearMixed_PC1)$USUBJID
+
+# Now tidy using broom
+stage2_slope_pc1 <- tidy(LinearMixed_PC1) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_pc1$se_fixed_effects <- summary(LinearMixed_PC1)$coefficients[, "Std. Error"]
+confint(LinearMixed_PC1, method = "Wald")
+# For comparison 
+comp_pc1_coefs<- stage2_slope_pc1
+```
+> model converged fine
+
+```{r}
+summary(LinearMixed_PC1)
+```
+
+```{r}
+gr_pc <- ref_grid(LinearMixed_PC1, cov.keep= c('ARM', 'DAY'))
+emm_pc <- emmeans(gr_pc, spec= c('ARM', 'DAY'), level= 0.95)
+emm_pc_df <- as.data.frame(emm_pc)
+```
+
+```{r}
+ggplot(df, aes(x=DAY, y=pc1))+
+        geom_line(data= data.frame(emm_ttp), aes(y= emmean), color ='blue', size = 1.5) +
+        scale_x_continuous(limits = c(0, 15), breaks = c(0,2,4,6,8,10,12,14))+
+        facet_wrap(~ARM,nrow=2)+
+        labs(y = "log10(TTP) (hrs)",
+             x = "Day(s) of treatment")+
+        theme(axis.title = element_text(size = 16))
+
+```
+
+```{r}
+summary(LinearMixed_CFU)
+colnames(coef_model_pc1)
+```
+
+```{r}
+colnames(coef_model_pc1)
+```
+
+#### Forest plot
+```{r}
+plt <- plot_coefs(LinearMixed_PC1,LinearMixed_TTP,LinearMixed_CFU,
+           model.names = c('PC1 (n=105)',
+                           'MGIT TTP (n=105)',
+                           'CFU (n=105)'),
+          omit.coefs = "(Intercept)",
+           coefs=c('CLOFAZIMINE'='DAY:ARMCLOFAZIMINE',
+                   'PYRAZINAMIDE'='DAY:ARMPYRAZINAMIDE',
+                   'Rifafour e-275'='DAY:ARMRifafour e-275',
+                   'TMC207 + PA-824 + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + CLOFAZIMINE',
+                   'TMC207 + PA-824 + PYRAZINAMIDE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE',
+                   'TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE',
+                   'TMC207 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE'
+                   ),
+           scale=TRUE, size=8,legend.title="")
+
+plt <- plt +
+  scale_color_manual(values = c(
+    "CFU (n=105)" = "#F8766D",
+    "MGIT TTP (n=105)" = "#7CAE00",
+    "PC1 (n=105)" = "#00BFC4"
+  )) +
+  facet_wrap(~ model, ncol=2, scales = "free_x") +
+  theme_minimal() +
+#+   scale_x_continuous(breaks = c(0, seq(-1, 1, by = 0.1))) + 
+  theme(axis.text.x = element_text(size = 9),
+        axis.title.x=element_text(size=12),
+        strip.text=element_text(size=10),
+        axis.text.y = element_text(size = 10),
+#        axis.title.y=element_blank(),
+        legend.text=element_text(),
+        legend.title = element_text(),
+        legend.position='none'
+        )+
+  guides(shape=guide_legend(reverse = TRUE))+
+  labs(x='Model coefficient',
+       y='Treatment arm')
+#CFU-'#F8766D'
+#TTP-'#7CAE00'
+#PC1-'#00BFC4'
+plt
+
+ggsave("260528mm_linMixMod_CFU_TTP_PC1.png", plt, device='png', 
+       dpi = 600, bg='white') 
+```
+
+#### Standarised response
+##### TTP
+```{r}
+### Random slope + INTERCEPT
+df_ttp$logTTP_sc<- scale(df_ttp$logTTP, center=T,scale=T)
+
+LinearMixed_TTPsc <- lmer(logTTP_sc ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df_ttp) 
+coef_model_TTP <- coef(LinearMixed_TTPsc)$USUBJID
+
+# Now tidy using broom
+stage2_slope_ttp <- tidy(LinearMixed_TTPsc) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_ttp$se_fixed_effects <- summary(LinearMixed_TTPsc)$coefficients[, "Std. Error"]
+confint(LinearMixed_TTPsc, method = "Wald")
+# For comparison 
+comp_ttp_coefs<- stage2_slope_ttp
+```
+
+##### CFU
+```{r}
+### Random slope + INTERCEPT
+df_cfu$logCFU_sc<- scale(df_cfu$logCFU, center=T,scale=T)
+
+LinearMixed_CFUsc <- lmer(logCFU_sc ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df_cfu) 
+coef_model_cfu <- coef(LinearMixed_CFUsc)$USUBJID
+
+# Now tidy using broom
+stage2_slope_CFU <- tidy(LinearMixed_CFUsc) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_CFU$se_fixed_effects <- summary(LinearMixed_CFUsc)$coefficients[, "Std. Error"]
+confint(LinearMixed_CFUsc, method = "Wald")
+# For comparison 
+comp_cfu_coefs<- stage2_slope_CFU
+```
+
+##### PC1
+```{r}
+### Random slope + INTERCEPT
+df_all$PC1_sc<- scale(df_all$PC1, center=T,scale=T)
+
+LinearMixed_PCsc <- lmer(PC1_sc ~ DAY:(1+ARM) + (DAY|USUBJID),
+                      data = df_all) 
+coef_model_PC <- coef(LinearMixed_PCsc)$USUBJID
+
+# Now tidy using broom
+stage2_slope_PC <- tidy(LinearMixed_PCsc) %>%
+  filter(effect == "fixed") %>%
+  mutate(ci95 = str_c(
+    format(round(estimate,digits=4),nsmall=2),
+    " (",
+    format(round(estimate - 1.96*std.error,digits=4),nsmall=2),
+    ", ",
+    format(round(estimate + 1.96*std.error,digits=4),nsmall=2),
+    ")"
+    )
+    
+  ) %>%
+  dplyr::select(term,ci95)
+
+stage2_slope_PC$se_fixed_effects <- summary(LinearMixed_PCsc)$coefficients[, "Std. Error"]
+confint(LinearMixed_PCsc, method = "Wald")
+# For comparison 
+comp_PC_coefs<- stage2_slope_PC
+```
+```{r}
+summary(LinearMixed_PCsc)
+```
+
+> model converged OK
+
+###### Forest plot
+```{r}
+plt <- plot_coefs(LinearMixed_TTPsc,LinearMixed_PCsc,LinearMixed_CFUsc,
+           model.names = c('MGIT TTP (n=105)','PC1 (n=105)',
+                           
+                           'CFU (n=105)'),
+          omit.coefs = "(Intercept)",
+           coefs=c('CLOFAZIMINE'='DAY:ARMCLOFAZIMINE',
+                   'PYRAZINAMIDE'='DAY:ARMPYRAZINAMIDE',
+                   'Rifafour e-275'='DAY:ARMRifafour e-275',
+                   'TMC207 + PA-824 + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + CLOFAZIMINE',
+                   'TMC207 + PA-824 + PYRAZINAMIDE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE',
+                   'TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE',
+                   'TMC207 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE'
+                   ),
+           scale=TRUE, size=8,legend.title="")
+
+plt <- plt +
+  scale_color_manual(values = c(
+    "CFU (n=105)" = "#F8766D",
+    "MGIT TTP (n=105)" = "#7CAE00",
+    "PC1 (n=105)" = "#00BFC4"
+  )) +
+  facet_wrap(~ model, ncol=3, scales = "free_x") +
+  theme_minimal() +
+#+   scale_x_continuous(breaks = c(0, seq(-1, 1, by = 0.1))) + 
+  theme(axis.text.x = element_text(size =12),
+        axis.title.x=element_text(size=15, face="bold"),
+        strip.text=element_text(size=16, face="bold"),
+        axis.text.y = element_text(size = 15, face="bold"),
+        axis.title.y = element_text(size = 15, face="bold"),
+#        axis.title.y=element_blank(),
+        legend.text=element_text(),
+        legend.title = element_text(),
+        legend.position='none'
+        )+
+  guides(shape=guide_legend(reverse = TRUE))+
+  labs(x='Model coefficient',
+       y='Treatment arm')
+
+#CFU-'#F8766D'
+#TTP-'#7CAE00'
+#PC1-'#00BFC4'
+plt
+```
+
+
+```{r}
+ggsave("260608mm_linMixMod_CFU_TTP_PC1_standardised_NO_ULQTTP.tiff", plt, device='tiff', 
+       width = 18, dpi = 600, units = "in",
+       bg='white')#height = 5,
+```
+
+
+####### Table of standardised SEs
+```{r}
+std_ses<-data.frame(
+  tx_arm = comp_PC_coefs$term,
+  CFU_std_se = c(comp_cfu_coefs$se_fixed_effects),
+  TTP_std_se = c(comp_ttp_coefs$se_fixed_effects),
+  PC1_std_se = c(comp_PC_coefs$se_fixed_effects)
+)
+std_ses
+```
+
+
+```{r}
+#MDE <- 2.8 xSE(B_stand) <<- For individual model estimates
+
+```
+
+####### Global precision
+```{r}
+anova(LinearMixed_TTPsc, type = 3)
+anova(LinearMixed_PCsc, type = 3)
+
+cat("TTP Residual Noise:", sigma(LinearMixed_TTPsc)^2, "\n")
+cat("PC1 Residual Noise:", sigma(LinearMixed_PCsc)^2, "\n")
+```
+######## Comparing CI width intervals
+```{r}
+#'Rifafour e-275'='DAY:ARMRifafour e-275',
+#'TMC207 + PA-824 + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + CLOFAZIMINE',
+#'TMC207 + PA-824 + PYRAZINAMIDE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE',
+#'TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE',
+#'TMC207 + PYRAZINAMIDE + CLOFAZIMINE'='DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE'
+
+emm_ttp <- emmeans(LinearMixed_TTPsc, ~ ARM | DAY)
+emm_pc1 <- emmeans(LinearMixed_PCsc, ~ ARM | DAY)
+
+combo_contrasts <- list(
+  "TMC207 + PA-824 + CLOFAZIMINE vs Rifafour e-275" = c(-1, 1, 0, 0, 0, 0, 0),
+  "TMC207 + PA-824 + PYRAZINAMIDE vs Rifafour e-275" = c(-1, 0, 1, 0, 0, 0, 0),
+  "TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE vs Rifafour e-275" = c(-1, 0, 0, 1, 0, 0, 0),
+  "TMC207 + PYRAZINAMIDE + CLOFAZIMINE vs Rifafour e-275" = c(-1, 0, 0, 0, 1, 0, 0)
+)
+
+# 3. Get Dunnett-adjusted 90% Confidence Intervals
+ci_ttp <- confint(contrast(emm_ttp, method = combo_contrasts), level = 0.90, adjust = "mvt")
+ci_pc1 <- confint(contrast(emm_pc1, method = combo_contrasts), level = 0.90, adjust ßßß= "mvt")
+
+# 4. Calculate and compare widths
+ci_ttp$width <- ci_ttp$upper.CL - ci_ttp$lower.CL
+ci_pc1$width <- ci_pc1$upper.CL - ci_pc1$lower.CL
+
+# 5. Print your final evidence table
+data.frame(Contrast = ci_ttp$contrast, TTP_Width = ci_ttp$width, PC1_Width = ci_pc1$width)
+
+```
+
+
+
+#### ANOVA of model estimates
+##### TTP
+```{r}
+anova(LinearMixed_TTP, type=3)
+```
+
+##### CFU
+```{r}
+anova(LinearMixed_CFU, type=3)
+```
+
+##### PC1
+```{r}
+anova(LinearMixed_PC1, type=3)
+```
+
+
+
+#### ANOVA of patient estimates
+```{r}
+## get patient level slopes per measurement for ANOVA
+write.csv(coef_model_pc1, "PC_model_est_per_px.csv")
+write.csv(coef_model_CFU, "CFU_model_est_per_px.csv")
+```
+
+##### TTP
+```{r}
+write.csv(coef_model_TTP, "TTP_model_est_per_px.csv")
+idv_estimates <- read_csv("TTP_model_est_per_px.csv", col_names = TRUE)
+names(idv_estimates)[1] <- "Participant.ID"
+idv_estimates$USUBJID <- as.factor(idv_estimates$Participant.ID)
+
+```
+                                
+```{r}
+tx_alloc<-df|>
+  select(c(USUBJID,ARM))
+patient_TTP_estimates <- left_join(idv_estimates,tx_alloc, by = 'USUBJID') %>%
+  mutate(ch1 = ifelse(ARM == "CLOFAZIMINE", 1, 0),
+         ch2 = ifelse(ARM == "PYRAZINAMIDE", 1, 0),
+         ch3 = ifelse(ARM == "Rifafour e-275", 1, 0),
+         ch4 = ifelse(ARM == "TMC207 + PA-824 + CLOFAZIMINE", 1, 0),
+         ch5 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE", 1, 0),
+         ch6 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ch7 = ifelse(ARM == "TMC207 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ) %>%
+  mutate(idv_slp = DAY + 
+           `DAY:ARMCLOFAZIMINE`*ch1 + 
+           `DAY:ARMPYRAZINAMIDE`*ch2+
+           `DAY:ARMRifafour e-275`*ch3+
+           `DAY:ARMTMC207 + PA-824 + CLOFAZIMINE`*ch4+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE`*ch5+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE`*ch6+
+           `DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE`*ch7)
+
+write.csv(patient_TTP_estimates,
+          "/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/TTP_slopes_per_px.csv")
+```
+
+
+##### CFU
+```{r}
+write.csv(coef_model_CFU, "CFU_model_est_per_px.csv")
+idv_estimates <- read_csv("CFU_model_est_per_px.csv", col_names = TRUE)
+names(idv_estimates)[1] <- "Participant.ID"
+idv_estimates$USUBJID <- as.factor(idv_estimates$Participant.ID)
+```
+                                
+```{r}
+tx_alloc<-df|>
+  select(c(USUBJID,ARM))
+patient_CFU_estimates <- left_join(idv_estimates,tx_alloc, by = 'USUBJID') %>%
+  mutate(ch1 = ifelse(ARM == "CLOFAZIMINE", 1, 0),
+         ch2 = ifelse(ARM == "PYRAZINAMIDE", 1, 0),
+         ch3 = ifelse(ARM == "Rifafour e-275", 1, 0),
+         ch4 = ifelse(ARM == "TMC207 + PA-824 + CLOFAZIMINE", 1, 0),
+         ch5 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE", 1, 0),
+         ch6 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ch7 = ifelse(ARM == "TMC207 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ) %>%
+  mutate(idv_slp = DAY + 
+           `DAY:ARMCLOFAZIMINE`*ch1 + 
+           `DAY:ARMPYRAZINAMIDE`*ch2+
+           `DAY:ARMRifafour e-275`*ch3+
+           `DAY:ARMTMC207 + PA-824 + CLOFAZIMINE`*ch4+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE`*ch5+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE`*ch6+
+           `DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE`*ch7)
+
+write.csv(patient_CFU_estimates,
+          "/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/CFU_slopes_per_px.csv")
+```
+
+
+##### PC1
+```{r}
+write.csv(coef_model_pc1, "PC_model_est_per_px.csv")
+idv_estimates <- read_csv("PC_model_est_per_px.csv", col_names = TRUE)
+names(idv_estimates)[1] <- "Participant.ID"
+idv_estimates$USUBJID <- as.factor(idv_estimates$Participant.ID)
+
+```
+                                
+```{r}
+tx_alloc<-df|>
+  select(c(USUBJID,ARM))
+patient_PC1_estimates <- left_join(idv_estimates,tx_alloc, by = 'USUBJID') %>%
+  mutate(ch1 = ifelse(ARM == "CLOFAZIMINE", 1, 0),
+         ch2 = ifelse(ARM == "PYRAZINAMIDE", 1, 0),
+         ch3 = ifelse(ARM == "Rifafour e-275", 1, 0),
+         ch4 = ifelse(ARM == "TMC207 + PA-824 + CLOFAZIMINE", 1, 0),
+         ch5 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE", 1, 0),
+         ch6 = ifelse(ARM == "TMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ch7 = ifelse(ARM == "TMC207 + PYRAZINAMIDE + CLOFAZIMINE", 1, 0),
+         ) %>%
+  mutate(idv_slp = DAY + 
+           `DAY:ARMCLOFAZIMINE`*ch1 + 
+           `DAY:ARMPYRAZINAMIDE`*ch2+
+           `DAY:ARMRifafour e-275`*ch3+
+           `DAY:ARMTMC207 + PA-824 + CLOFAZIMINE`*ch4+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE`*ch5+
+           `DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE + CLOFAZIMINE`*ch6+
+           `DAY:ARMTMC207 + PYRAZINAMIDE + CLOFAZIMINE`*ch7)
+
+write.csv(patient_PC1_estimates,
+          "/Users/mairi.mcclean/Desktop/btz/manuscript_posters/CPT_PSP_submission/submitted/revisions/extra_analysis/processed_data/PC1_slopes_per_px.csv")
+```
+
+
+#### Simple stats on model slopes
+```{r}
+#### Original authors ran ANOVA (on patient slopes? Or model estimates) TBD
+res.ttp<-aov(idv_slp ~ ARM, data=patient_TTP_estimates)
+summary(res.ttp)
+```
+
+```{r}
+res.cfu<-aov(idv_slp ~ ARM, data=patient_CFU_estimates)
+summary(res.cfu)
+```
+
+```{r}
+res.pc1<-aov(idv_slp ~ ARM, data=patient_PC1_estimates)
+summary(res.pc1)
+```
+> PC1 better than CFU, not better than TTP, to determine an overall effect
+
+##### H0 tests
+> How are the H0 tests for beta==0, and control == experimental arm
+>> Get all 10 and then correct for MTC?
+
+```{r}
+# 'DAY:ARMCLOFAZIMINE=0'
+linearHypothesis(LinearMixed_TTP, c('DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE=DAY:ARMRifafour e-275'))
+```
+
+```{r}
+linearHypothesis(LinearMixed_CFU, c('DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE=DAY:ARMRifafour e-275'))
+```
+
+```{r}
+linearHypothesis(LinearMixed_PC1, c('DAY:ARMTMC207 + PA-824 + PYRAZINAMIDE=DAY:ARMRifafour e-275'))
+```
+
+
+#### Coefficients of variation
+```{r }
+model_list <- c(LinearMixed_CFU,LinearMixed_TTP, LinearMixed_PC1)
+
+calculate_cv <- function(model) {
+  re_varcorr <- VarCorr(model)
+  random_intercept_var <- as.numeric(re_varcorr$USUBJID[1, 1]) 
+  fixed_effect_mean <- fixef(model)[1]
+  model_cv <- sqrt(random_intercept_var) / fixed_effect_mean * 100
+  return(model_cv)
+}
+
+
+cv_results <- sapply(model_list, calculate_cv)
+cv_table <- data.frame(cv_results)
+rownames(cv_table) <- c('LinearMixedCFU','LinearMixed_TTP', 'LinearMixed_PC1')
+print(cv_table)
+```
+
+##### Lollipop/cleveland plots for CV values
+```{r}
+calculate_cv_FE <- function(model) {
+  coef_tab <- coef(summary(model))
+  beta<-coef_tab[,"Estimate"]
+  se<-coef_tab[,"Std. Error"]
+  model_cv <- (se / abs(beta)) * 100
+  return(model_cv)
+}
+cv_results <- sapply(model_list, calculate_cv_FE)
+cv_table <- data.frame(cv_results)
+colnames(cv_table) <- c('logCFU', 'logTTP', 'PC1')
+print(cv_table)
+cv_table$arm<-rownames(cv_table)
+cv_table<-cv_table[-1,]
+```
+
+```{r}
+cv_df<-cv_table |>
+  pivot_longer(c(logCFU,logTTP,PC1),
+    names_to="Assay",
+    values_to="CV"
+  )
+```
+
+
+```{r}
+ggplot(cv_df, aes(x=CV, y=arm, color=Assay)) + 
+  geom_point(size=3) + 
+  geom_segment(aes(y=arm, 
+                   yend=arm, 
+                   x=0, 
+                   xend=max(CV)), linetype="dashed", 
+               size=0.1) + 
+  labs(title="Cleveland dot chart", 
+       subtitle="CV of per-arm TE") + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6)) +
+  theme_minimal()
+```
+
+
+### Bilinear mixed models
+```{r}
+
+```
+
